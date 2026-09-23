@@ -43,7 +43,7 @@ export async function readStoredFile(filename: string): Promise<Buffer> {
 // entries are unlinked concurrently — much faster on large cache dirs.
 export async function evictExpiredFiles(): Promise<number> {
   const dir = downloadDir();
-  const entries = await fs.readdir(dir).catch(() => []);
+  const entries = await fs.readdir(/*turbopackIgnore: true*/ dir).catch(() => []);
   const cutoff = Date.now() - DOWNLOAD_CONFIG.fileTtlHours * 3_600_000;
 
   // Resolve stat for every entry in parallel.

@@ -35,13 +35,15 @@ function useCountUp(target: number | null): number | null {
     const start = performance.now();
     const duration = 800;
     const from = display;
+    // Capture in a const so TypeScript knows it is non-null inside step().
+    const to = target;
 
     function step(now: number) {
       const elapsed = now - start;
       const progress = Math.min(elapsed / duration, 1);
       // Ease-out cubic
       const eased = 1 - Math.pow(1 - progress, 3);
-      setDisplay(Math.round(from + (target - from) * eased));
+      setDisplay(Math.round(from + (to - from) * eased));
       if (progress < 1) {
         rafRef.current = requestAnimationFrame(step);
       }
