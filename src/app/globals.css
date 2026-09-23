@@ -1,0 +1,127 @@
+@import "tailwindcss";
+
+/* ─── Dark theme (default) ─────────────────────────────────────────────── */
+:root,
+html[data-theme="dark"] {
+  --gtu-bg: #0b0e13;
+  --gtu-surface: #11151d;
+  --gtu-elevated: #171d28;
+  --gtu-border: #232b3a;
+  --gtu-border-strong: #2f3a4f;
+  --gtu-text: #e8ecf3;
+  --gtu-text-secondary: #aab4c5;
+  --gtu-text-muted: #6b7688;
+  --gtu-accent: #4f8cff;
+  --gtu-accent-hover: #3b76e6;
+  --gtu-accent-soft: rgba(79, 140, 255, 0.12);
+  --gtu-success: #34c98e;
+  --gtu-warning: #e5a13d;
+  --gtu-error: #e5605f;
+  --gtu-radius: 10px;
+  --gtu-ring: rgba(79, 140, 255, 0.45);
+  color-scheme: dark;
+}
+
+/* ─── Light theme ───────────────────────────────────────────────────────── */
+/* Professional, warm-neutral palette — not AI-generic "white + blue".       */
+/* Inspired by Linear / Vercel / Notion light modes.                          */
+html[data-theme="light"] {
+  --gtu-bg: #f5f4f0;           /* warm off-white — not pure white */
+  --gtu-surface: #ffffff;
+  --gtu-elevated: #eeece8;     /* pressed/hover state */
+  --gtu-border: #dbd8d2;       /* warm gray border */
+  --gtu-border-strong: #c9c5be;
+  --gtu-text: #1a1916;         /* near-black with warm tint */
+  --gtu-text-secondary: #4a4742; /* warm mid-gray */
+  --gtu-text-muted: #8c897f;
+  --gtu-accent: #2563eb;       /* vivid blue — distinct from dark mode */
+  --gtu-accent-hover: #1d4ed8;
+  --gtu-accent-soft: rgba(37, 99, 235, 0.08);
+  --gtu-success: #16a34a;
+  --gtu-warning: #d97706;
+  --gtu-error: #dc2626;
+  --gtu-radius: 10px;
+  --gtu-ring: rgba(37, 99, 235, 0.35);
+  color-scheme: light;
+}
+
+@theme inline {
+  --color-gtu-bg: var(--gtu-bg);
+  --color-gtu-surface: var(--gtu-surface);
+  --color-gtu-elevated: var(--gtu-elevated);
+  --color-gtu-border: var(--gtu-border);
+  --color-gtu-accent: var(--gtu-accent);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  background: var(--gtu-bg);
+  color: var(--gtu-text);
+  font-family: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Visible keyboard focus everywhere (accessibility baseline). */
+:where(a, button, input, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--gtu-accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* Subtle skeleton shimmer that respects the surface color. */
+@keyframes gtu-shimmer {
+  0% { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+
+.gtu-skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--gtu-surface) 25%,
+    var(--gtu-elevated) 50%,
+    var(--gtu-surface) 75%
+  );
+  background-size: 800px 100%;
+  animation: gtu-shimmer 1.6s linear infinite;
+}
+
+/* Indeterminate progress bar pinned to the bottom of a busy button. */
+@keyframes gtu-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
+/* Steady rotation for the circular loader ring. */
+@keyframes gtu-rotate {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.gtu-spin {
+  animation: gtu-rotate 0.9s linear infinite;
+  transform-origin: center;
+}
+
+.gtu-progress-bar {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 3px;
+  width: 25%;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.85);
+  animation: gtu-slide 1.2s ease-in-out infinite;
+}
+
+/* Honors users who prefer reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  .gtu-skeleton {
+    animation: none;
+  }
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
