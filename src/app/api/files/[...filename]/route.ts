@@ -1,24 +1,47 @@
-// GET /api/files/[...filename]
-//
-// Legacy route kept for backward compatibility with shared links that were
-// generated before the Vercel Blob migration.
-//
-// New downloads now use Vercel Blob public URLs directly — this route is no
-// longer the primary serving path. It returns 410 Gone so old links fail
-// gracefully with a clear message rather than a cryptic 404.
+// GET /api/files/[...filename] — serves generated PDFs from temp storage.
+// Validates names strictly; never exposes internal paths.
+// ?view=1 serves inline for new-tab preview; default forces download.
 
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
+import { readStoredFile } from "@/server/file-store";
+import { checkRateLimit, clientKey } from "@/server/rate-limit";
 
 export const runtime = "nodejs";
 
-export async function GET(): Promise<NextResponse> {
-  return NextResponse.json(
-    {
-      error:
-        "This link has expired. Please re-fetch the papers to get a fresh download link.",
-    },
-    {
-      status: 410, // 410 Gone — resource no longer served here.
-    },
-  );
+const FILE_LIMIT = 60;
+const FILE_WINDOW_MS = 60_000;
+
+export async function GET(
+  request: NextRequest,
+  context: { params: Promise<{ filename: string[] }> },
+) {
+  // Light abuse guard on file serving.
+  if (
+    !checkRateLimit(
+      clientKey(request.headers, "files"),
+      FILE_LIMIT,
+      FILE_WINDOW_MS,
+    )
+  ) {
+    return NextResponse.json({ error: "Too many requests." }, { status: 429 });
+  }
+
+  // Joins catch-all segments, then the store re-validates the name.
+  const { filename } = await context.params;
+  const name = filename.join("/");
+  // Inline previews render in the browser; downloads save to disk.
+  const inline = request.nextUrl.searchParams.get("view") === "1";
+  try {
+    const bytes = await readStoredFile(name);
+    return new NextResponse(new Uint8Array(bytes), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${name}"`,
+        "Cache-Control": "private, max-age=3600",
+      },
+    });
+  } catch {
+    return NextResponse.json({ error: "File not found or expired." }, { status: 404 });
+  }
 }

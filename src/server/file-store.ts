@@ -1,104 +1,67 @@
-// Temporary file store — backed by Vercel Blob Storage.
-//
-// Why Blob instead of /tmp:
-//   Vercel serverless functions are stateless containers. Files written to
-//   /tmp on container A are invisible to container B that serves the next
-//   request. Vercel Blob is a shared object store — every container sees the
-//   same files — so download links keep working across invocations.
-//
-// TTL strategy:
-//   There is no native TTL in Vercel Blob. We tag each blob's pathname with
-//   an ISO-date prefix (YYYY-MM-DD/) so a periodic cleanup (or the next
-//   storeFile call) can delete any blob older than fileTtlHours.
-//   Cleanup is best-effort and never fails the request.
-//
-// Local / offline fallback:
-//   When BLOB_READ_WRITE_TOKEN is absent (local dev without Blob configured)
-//   every function throws immediately so callers see clear errors instead of
-//   silent data loss. Set the env var to enable Blob in production.
+// Temporary file store for generated PDFs with TTL cleanup.
+// No database: files live under DOWNLOAD_DIR and expire automatically.
 
+import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { DOWNLOAD_CONFIG } from "@/config/download.config";
 
-// ─── Types (inlined to avoid SDK import at module level) ─────────────────────
+const DEFAULT_SUBDIR = "gtu-papers";
+const SAFE_FILENAME = /^[A-Z0-9][A-Z0-9_.-]*\.pdf$/i;
 
-interface BlobPutResult {
-  url: string;
-  pathname: string;
-  contentType: string;
-  contentDisposition: string;
+// Resolves the download directory (env override, else OS temp dir).
+export function downloadDir(): string {
+  return process.env.DOWNLOAD_DIR ?? path.join(tmpdir(), DEFAULT_SUBDIR);
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Today's UTC date string used as a blob path prefix, e.g. "2024-01-15". */
-function todayPrefix(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-/**
- * Converts fileTtlHours into a Date cutoff.
- * Any blob whose pathname starts with a date before the cutoff is expired.
- */
-function expiryDate(): Date {
-  return new Date(Date.now() - DOWNLOAD_CONFIG.fileTtlHours * 3_600_000);
-}
-
-// ─── Core API ─────────────────────────────────────────────────────────────────
-
-/**
- * Uploads a PDF buffer to Vercel Blob and returns its public URL.
- * Pathname: "<YYYY-MM-DD>/<filename>" so cleanup can target old prefixes.
- * Triggers a best-effort expiry sweep on each write (never blocks the caller).
- */
+// Writes a file atomically (temp + rename) to avoid partial downloads.
 export async function storeFile(
   filename: string,
   bytes: Buffer,
 ): Promise<string> {
-  const { put } = await import("@vercel/blob");
-
-  const pathname = `${todayPrefix()}/${filename}`;
-  const result: BlobPutResult = await put(pathname, bytes, {
-    access: "public",
-    contentType: "application/pdf",
-    // Replaces an existing blob with the same name instead of duplicating.
-    allowOverwrite: true,
-  });
-
-  // Fire-and-forget expiry sweep — never blocks the response.
-  void evictExpiredBlobs().catch(() => undefined);
-
-  return result.url;
+  if (!SAFE_FILENAME.test(filename)) throw new Error("Unsafe filename");
+  const dir = downloadDir();
+  await fs.mkdir(dir, { recursive: true });
+  const tempName = `.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const tempPath = path.join(dir, tempName);
+  const finalPath = path.join(dir, filename);
+  await fs.writeFile(tempPath, bytes);
+  await fs.rename(tempPath, finalPath);
+  // Best-effort expiry sweep on each write; never fails the request.
+  void evictExpiredFiles().catch(() => undefined);
+  return finalPath;
 }
 
-/**
- * Deletes blobs whose date prefix is older than fileTtlHours.
- * Called opportunistically on each storeFile; safe to call independently.
- * Returns the number of blobs deleted.
- */
-export async function evictExpiredBlobs(): Promise<number> {
-  const { list, del } = await import("@vercel/blob");
+// Reads a stored file after validating the name (blocks path traversal).
+export async function readStoredFile(filename: string): Promise<Buffer> {
+  if (!SAFE_FILENAME.test(filename)) throw new Error("Unsafe filename");
+  return fs.readFile(path.join(downloadDir(), filename));
+}
 
-  const cutoff = expiryDate();
-  // Vercel Blob list() is paginated; cursor loop collects all blobs.
-  let deleted = 0;
-  let cursor: string | undefined;
+// Deletes files older than the configured TTL.
+// All stat() calls are fired in parallel (one OS batch), then expired
+// entries are unlinked concurrently — much faster on large cache dirs.
+export async function evictExpiredFiles(): Promise<number> {
+  const dir = downloadDir();
+  const entries = await fs.readdir(/*turbopackIgnore: true*/ dir).catch(() => []);
+  const cutoff = Date.now() - DOWNLOAD_CONFIG.fileTtlHours * 3_600_000;
 
-  do {
-    const page = await list({ cursor, limit: 100 });
-    const expired = page.blobs.filter((blob) => {
-      // Pathname format: "YYYY-MM-DD/filename.pdf"
-      const datePart = blob.pathname.split("/")[0];
-      if (!datePart || !/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return false;
-      return new Date(datePart) < cutoff;
-    });
+  // Resolve stat for every entry in parallel.
+  const stats = await Promise.all(
+    entries.map(async (entry) => {
+      // Orphaned temp files are always removed immediately.
+      if (entry.startsWith(".tmp-")) return { entry, expired: true };
+      const stat = await fs.stat(path.join(dir, entry)).catch(() => null);
+      return { entry, expired: stat !== null && stat.mtimeMs < cutoff };
+    }),
+  );
 
-    if (expired.length > 0) {
-      await del(expired.map((b) => b.url));
-      deleted += expired.length;
-    }
-
-    cursor = page.cursor;
-  } while (cursor);
-
-  return deleted;
+  // Unlink all expired files in parallel.
+  const expired = stats.filter((s) => s.expired);
+  await Promise.all(
+    expired.map(({ entry }) =>
+      fs.unlink(path.join(dir, entry)).catch(() => undefined),
+    ),
+  );
+  return expired.length;
 }

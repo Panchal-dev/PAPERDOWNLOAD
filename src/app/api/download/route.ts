@@ -103,11 +103,9 @@ export async function POST(request: NextRequest) {
             sourceUrl?: string,
           ): Promise<boolean> => {
             try {
-              // storeFile uploads to Vercel Blob and returns the public URL.
-              // No local /api/files/ path needed — the blob URL works directly.
-              const blobUrl = await storeFile(filename, bytes);
+              await storeFile(filename, bytes);
               const item: DownloadFileItem = {
-                url: blobUrl,
+                url: `/api/files/${encodeURIComponent(filename)}`,
                 filename,
                 sizeBytes: bytes.length,
                 format,
