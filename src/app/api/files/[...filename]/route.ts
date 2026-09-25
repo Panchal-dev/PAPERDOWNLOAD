@@ -1,9 +1,10 @@
-// GET /api/files/[...filename] — serves generated PDFs from temp storage.
+// GET /api/files/[...filename] — streams generated PDFs from temp storage.
 // Validates names strictly; never exposes internal paths.
 // ?view=1 serves inline for new-tab preview; default forces download.
 
 import { NextRequest, NextResponse } from "next/server";
-import { readStoredFile } from "@/server/file-store";
+import { Readable } from "node:stream";
+import { openStoredFileStream } from "@/server/file-store";
 import { checkRateLimit, clientKey } from "@/server/rate-limit";
 
 export const runtime = "nodejs";
@@ -15,7 +16,6 @@ export async function GET(
   request: NextRequest,
   context: { params: Promise<{ filename: string[] }> },
 ) {
-  // Light abuse guard on file serving.
   if (
     !checkRateLimit(
       clientKey(request.headers, "files"),
@@ -26,14 +26,17 @@ export async function GET(
     return NextResponse.json({ error: "Too many requests." }, { status: 429 });
   }
 
-  // Joins catch-all segments, then the store re-validates the name.
   const { filename } = await context.params;
   const name = filename.join("/");
-  // Inline previews render in the browser; downloads save to disk.
   const inline = request.nextUrl.searchParams.get("view") === "1";
+
   try {
-    const bytes = await readStoredFile(name);
-    return new NextResponse(new Uint8Array(bytes), {
+    const nodeStream = await openStoredFileStream(name);
+    // Convert Node Readable → Web ReadableStream so Next.js streams the
+    // body chunk-by-chunk instead of materializing the whole file. Peak
+    // memory per request drops from ~file size to ~64 KB (one chunk).
+    const webStream = Readable.toWeb(nodeStream) as ReadableStream<Uint8Array>;
+    return new NextResponse(webStream, {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
@@ -42,6 +45,9 @@ export async function GET(
       },
     });
   } catch {
-    return NextResponse.json({ error: "File not found or expired." }, { status: 404 });
+    return NextResponse.json(
+      { error: "File not found or expired." },
+      { status: 404 },
+    );
   }
 }

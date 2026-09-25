@@ -45,7 +45,6 @@ function isVerified(request: NextRequest): boolean {
 export async function POST(request: NextRequest) {
   const started = Date.now();
 
-  // Abuse guard: bounded requests per client per minute.
   if (
     !checkRateLimit(
       clientKey(request.headers, "download"),
@@ -59,7 +58,6 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Bot guard: verification happens once per TTL, not per download.
   if (!isVerified(request)) {
     return NextResponse.json(
       { error: "Verification required.", code: VERIFICATION_CODE },
@@ -67,7 +65,6 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Trust boundary: strict schema validation before any upstream work.
   const body = (await request.json().catch(() => null)) as unknown;
   const parsed = downloadRequestSchema.safeParse(body);
   if (!parsed.success) {
@@ -79,7 +76,6 @@ export async function POST(request: NextRequest) {
   const { course, subjects } = parsed.data;
   const totalPdfs = subjects.length * expectedPerSubject();
 
-  // Streams events; each stored file flushes immediately to the client.
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
@@ -92,9 +88,6 @@ export async function POST(request: NextRequest) {
       try {
         send({ type: "start", totalPdfs });
 
-        // Subjects stay sequential with a small delay (upstream courtesy).
-        // Within a subject the emission order is strict: syllabus first,
-        // then singles as sessions land, then packs and merged files.
         for (const subjectCode of subjects) {
           const storeAndSend = async (
             filename: string,
@@ -103,7 +96,14 @@ export async function POST(request: NextRequest) {
             sourceUrl?: string,
           ): Promise<boolean> => {
             try {
-              await storeFile(filename, bytes);
+              // Sirf woh files disk pe likho jo server se serve hongi.
+              // sourceUrl wali (syllabus + singles) GTU se direct jaati
+              // hain — UI unhe /api/files se kabhi nahi maangta, isliye
+              // local copy pure waste hai. Per subject ~15 writes aur
+              // ~3.4 MB disk bachta hai.
+              if (!sourceUrl) {
+                await storeFile(filename, bytes);
+              }
               const item: DownloadFileItem = {
                 url: `/api/files/${encodeURIComponent(filename)}`,
                 filename,
@@ -153,8 +153,6 @@ export async function POST(request: NextRequest) {
             },
           );
 
-          // Singles stream out the moment their session PDF lands (past the
-          // gate). Their stores are tracked so packs never overtake them.
           const pendingSingles: Promise<unknown>[] = [];
           const papers = await fetchSubjectPapers(
             course,
@@ -177,8 +175,6 @@ export async function POST(request: NextRequest) {
           await syllabusPromise;
 
           if (!papers) {
-            // Nothing but possibly the syllabus: report every session gap
-            // (or the bare code when even the syllabus is missing).
             if (!syllabusBytes) {
               failed.push(subjectCode);
               send({ type: "unavailable", entry: subjectCode });
@@ -195,7 +191,6 @@ export async function POST(request: NextRequest) {
             continue;
           }
 
-          // Sessions with no archived PDF — normal gaps, reported live.
           const found = new Set(papers.files.keys());
           for (const session of [
             ...DOWNLOAD_CONFIG.summerSessions,
@@ -208,7 +203,8 @@ export async function POST(request: NextRequest) {
             }
           }
 
-          // Season packs + merged from the sessions found.
+          // Season packs + merged — yeh server pe hi bante hain, inhi ko
+          // disk pe store karo (storeAndSend me sourceUrl nahi jaata).
           for (const file of await buildPacksAndMerged(course, papers)) {
             await storeAndSend(file.filename, file.bytes, file.format);
           }
