@@ -1,105 +1,148 @@
-// Upstream GTU fetching: direct PDF URLs with retries and validation.
-// Architecture mirrors paper.py exactly:
-//   404         → null, no retry (definitive miss on GTU static host)
-//   timeout     → null, no retry (throttling; retrying makes it worse)
-//   network err → retry up to maxRetries with exponential backoff
-//   5xx / other → null, no retry (static file host never self-heals in seconds)
+// Upstream GTU fetching: direct PDF URLs with retries, host fallback,
+// and strict %PDF validation.
+//
+// Determinism contract (why results no longer vary between runs):
+//   404              → null, no retry (definitive miss on GTU static host)
+//   429 / 5xx        → retry with backoff, then fallback host
+//   timeout          → retry with backoff, then fallback host
+//   network error    → retry with backoff, then fallback host
+//   non-PDF 200 body → retry with backoff, then fallback host
+//   fallback host 404→ null, no retry (definitive miss on both hosts)
 
 import { DOWNLOAD_CONFIG } from "@/config/download.config";
 import type { SessionAsset, SubjectPapers } from "@/types/paper.types";
 
 const PDF_MAGIC = "%PDF";
-const RETRY_BASE_DELAY_MS = 400; // mirrors paper.py RETRY_BACKOFF × 1000
+const RETRY_BASE_DELAY_MS = 400;
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
-// Builds the canonical GTU paper URL.
-// Mirrors paper.py build_paper_url: BASE_URL/{season}{year}/{course}/{code}.pdf
-function buildPaperUrl(course: string, subject: string, session: string): string {
-  return `${DOWNLOAD_CONFIG.gtuBaseUrl}/${session}/${course}/${subject}.pdf`;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Jittered exponential backoff: 400ms, 800ms, 1600ms (+ up to 200ms noise).
+function backoffMs(attempt: number): number {
+  return RETRY_BASE_DELAY_MS * 2 ** attempt + Math.random() * 200;
 }
 
-// Downloads one PDF with timeout, typed retries, and %PDF validation.
-//
-// Retry rules (paper.py parity — both files identical after this change):
-//   • AbortError (timeout)   → null immediately. NO retry. Host is throttling.
-//   • HTTP 404               → null immediately. NO retry. Definitive miss.
-//   • HTTP 5xx / other 4xx   → null immediately. NO retry. Static host never
-//                              self-heals within retry window; fail fast.
-//   • Network drop (OS err)  → retry up to maxRetries with exponential backoff.
-async function fetchSessionPdf(
-  url: string,
-  attempt = 0,
-  maxRetries: number = DOWNLOAD_CONFIG.maxRetries,
-): Promise<Buffer | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    DOWNLOAD_CONFIG.fetchTimeoutMs,
-  );
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      cache: "no-store", // always live bytes from GTU
-      headers: {
-        // Match the User-Agent paper.py sends so GTU doesn't fingerprint-block.
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
-        Accept: "application/pdf,*/*",
-        Connection: "keep-alive",
-      },
-    });
-
-    // 404 = definitively missing on GTU's static host. Never retry.
-    if (response.status === 404) return null;
-    // 5xx / other 4xx: GTU is a static file host — it never self-heals within
-    // the retry window. Retrying only wastes time and adds load. Fail fast.
-    if (!response.ok) return null;
-
-    const bytes = Buffer.from(await response.arrayBuffer());
-    // Guard against HTML error pages served with HTTP 200.
-    if (
-      bytes.length < DOWNLOAD_CONFIG.minPdfBytes ||
-      !bytes.subarray(0, PDF_MAGIC.length).toString("ascii").startsWith(PDF_MAGIC)
-    ) {
-      return null;
-    }
-    return bytes;
-  } catch (err: unknown) {
-    // AbortError = our timeout fired. Paper.py never retries timeouts.
-    if (err instanceof Error && err.name === "AbortError") return null;
-
-    // Genuine network error (ECONNRESET, ENOTFOUND, etc.) — worth retrying.
-    if (attempt < maxRetries) {
-      const jitter = Math.random() * 200;
-      const delay = RETRY_BASE_DELAY_MS * 2 ** attempt + jitter;
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      return fetchSessionPdf(url, attempt + 1, maxRetries);
-    }
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// Fetches one session paper with full retries against the live host.
-// Mirrors paper.py: 404 → null instantly; network errors → retry up to maxRetries.
-async function fetchSession(
+// Builds the canonical GTU paper URL on a given host.
+function buildPaperUrl(
+  host: string,
   course: string,
   subject: string,
   session: string,
-): Promise<{ session: string; bytes: Buffer | null; url: string | null }> {
-  const url = buildPaperUrl(course, subject, session);
-  const bytes = await fetchSessionPdf(url);
-  return { session, bytes: bytes ?? null, url: bytes ? url : null };
+): string {
+  return `${host}/${session}/${course}/${subject}.pdf`;
 }
 
-// Fetches the official syllabus PDF for a subject (paper.py behavior).
-// Returns the bytes with their working URL, or null — a normal gap.
+function hasPdfMagic(bytes: Buffer): boolean {
+  return bytes
+    .subarray(0, PDF_MAGIC.length)
+    .toString("ascii")
+    .startsWith(PDF_MAGIC);
+}
+
+// Fetches one URL with timeout, bounded retries, and %PDF validation.
+// Retries on: timeout, network error, 429/5xx, non-PDF 200 bodies.
+// Does NOT retry 404 — that is a definitive miss on this host.
+async function fetchWithRetries(
+  url: string,
+  maxRetries: number = DOWNLOAD_CONFIG.maxRetries,
+): Promise<Buffer | null> {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      DOWNLOAD_CONFIG.fetchTimeoutMs,
+    );
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        cache: "no-store", // always live bytes from GTU
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+          Accept: "application/pdf,*/*",
+          Connection: "keep-alive",
+        },
+      });
+
+      // 404 = definitively missing on THIS host. Move on.
+      if (response.status === 404) return null;
+
+      // Transient server / rate-limit errors — retry.
+      if (RETRYABLE_STATUS.has(response.status)) {
+        if (attempt < maxRetries) {
+          await sleep(backoffMs(attempt));
+          continue;
+        }
+        return null;
+      }
+
+      // Other non-2xx: treat as a miss for this host.
+      if (!response.ok) return null;
+
+      const bytes = Buffer.from(await response.arrayBuffer());
+
+      // Guard against HTML error pages served with HTTP 200.
+      if (
+        bytes.length < DOWNLOAD_CONFIG.minPdfBytes ||
+        !hasPdfMagic(bytes)
+      ) {
+        if (attempt < maxRetries) {
+          await sleep(backoffMs(attempt));
+          continue;
+        }
+        return null;
+      }
+
+      return bytes;
+    } catch {
+      // Timeout (AbortError) OR network drop — both retryable. This is the
+      // fix that stops papers from disappearing between runs.
+      if (attempt < maxRetries) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
+}
+
+// Tries the primary host, then the fallback host. A 404 on the fallback is
+// treated as a definitive miss — no further retries across hosts.
+async function fetchSessionBytes(
+  course: string,
+  subject: string,
+  session: string,
+): Promise<{ bytes: Buffer; url: string } | null> {
+  // Widen both to `string`: the config values are `as const` literals, so
+  // a direct comparison would be narrowed to "always false" by TypeScript
+  // and flagged as dead code. Runtime equality is still possible if the
+  // two config values are ever set to the same string.
+  const primaryHost: string = DOWNLOAD_CONFIG.gtuBaseUrl;
+  const fallbackHost: string = DOWNLOAD_CONFIG.gtuFallbackBaseUrl;
+
+  const primaryUrl = buildPaperUrl(primaryHost, course, subject, session);
+  const primary = await fetchWithRetries(primaryUrl);
+  if (primary) return { bytes: primary, url: primaryUrl };
+
+  if (fallbackHost && fallbackHost !== primaryHost) {
+    const fallbackUrl = buildPaperUrl(fallbackHost, course, subject, session);
+    const fallback = await fetchWithRetries(fallbackUrl);
+    if (fallback) return { bytes: fallback, url: fallbackUrl };
+  }
+  return null;
+}
+
+// Fetches the official syllabus PDF for a subject.
 export async function fetchSyllabus(
   subjectCode: string,
 ): Promise<{ bytes: Buffer; url: string } | null> {
   const url = `${DOWNLOAD_CONFIG.syllabusBaseUrl}/${subjectCode}.pdf`;
-  const bytes = await fetchSessionPdf(url);
+  const bytes = await fetchWithRetries(url);
   return bytes ? { bytes, url } : null;
 }
 
@@ -117,15 +160,24 @@ export async function fetchSubjectPapers(
   ];
   const files = new Map<string, SessionAsset>();
   const queue = [...sessions];
+
   const workers = Array.from(
     { length: Math.min(DOWNLOAD_CONFIG.maxConcurrency, queue.length) },
     async () => {
       while (queue.length > 0) {
         const session = queue.shift() as string;
-        const result = await fetchSession(course, subjectCode, session);
-        if (result.bytes && result.url) {
-          files.set(result.session, { bytes: result.bytes, url: result.url });
-          onSession?.(result.session, result.bytes, result.url);
+        const result = await fetchSessionBytes(course, subjectCode, session);
+        if (result) {
+          files.set(session, result);
+          onSession?.(session, result.bytes, result.url);
+        }
+        // Small jittered pause between requests per worker — prevents
+        // all workers from re-hitting the host in the same tick after
+        // a retry wave (lock-step bursts are what trigger throttling).
+        if (DOWNLOAD_CONFIG.requestDelayMs > 0 && queue.length > 0) {
+          await sleep(
+            DOWNLOAD_CONFIG.requestDelayMs + Math.random() * 80,
+          );
         }
       }
     },
