@@ -35,7 +35,7 @@ export function SubjectInput({
         id="subject-codes"
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        placeholder="e.g. 3160704, 3160716"
+        placeholder="e.g. DI03000021 , ME0100061"
         rows={2}
         aria-invalid={invalid.length > 0}
         aria-describedby="subject-codes-hint"
